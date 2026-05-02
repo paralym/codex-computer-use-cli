@@ -77,8 +77,10 @@ public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
             _ = slpsSetFront(&frontPSN, 0)
             usleep(50000)
 
-            CGAssociateMouseAndMouseCursorPosition(1)
+            // Warp BEFORE reconnect to avoid 1-frame cursor jump.
+            // If we reconnect first, cursor briefly appears at the HID-moved position.
             CGWarpMouseCursorPosition(savedPos)
+            CGAssociateMouseAndMouseCursorPosition(1)
             CGDisplayShowCursor(CGMainDisplayID())
 
             hideFrozenOverlay()
