@@ -99,9 +99,9 @@ public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
         mouseController: MouseController
     ) throws {
         try withSyntheticFocus(targetPID: targetPID) {
-            CGWarpMouseCursorPosition(point)
-            CGAssociateMouseAndMouseCursorPosition(1)
-            try mouseController.click(at: point, button: button, clickCount: clickCount)
+            // Use postToPid — sends events directly to the process without
+            // going through the HID cursor system, so the real cursor stays put.
+            try mouseController.click(at: point, button: button, clickCount: clickCount, targetPID: targetPID)
         }
     }
 
