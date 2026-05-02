@@ -349,78 +349,88 @@ public actor ToolRouter {
     // MARK: - type_text
 
     public func typeText(_ text: String) async -> ToolResult {
-        // Strategy 1: AX set_value (zero activation)
-        if let pid = targetAppPID {
-            let appElement = AXUIElement.applicationElement(pid: pid)
-            if let focusedElement: AXUIElement = appElement.attribute(kAXFocusedUIElementAttribute) {
-                let role = focusedElement.role ?? ""
-                if role == "AXTextField" || role == "AXTextArea" || role == "AXComboBox" || role == "AXSearchField" {
-                    let currentValue = focusedElement.axValue ?? ""
-                    let newValue = currentValue + text
-                    let result = AXUIElementSetAttributeValue(
-                        focusedElement,
-                        kAXValueAttribute as CFString,
-                        newValue as CFTypeRef
-                    )
-                    if result == .success {
-                        return .text("Typed \(text.count) characters via AX set_value (background)")
-                    }
-                }
-            }
-        }
-
-        // Strategy 2: CGEvent keyboard via synthetic focus (for Electron apps that need
-        // NSApp.isActive to process keyboard events)
-        if let pid = targetAppPID {
-            await MainActor.run { focusStealPreventer.stop() }
+        guard let pid = targetAppPID else {
             do {
-                try syntheticFocusEnforcer.withSyntheticFocus(targetPID: pid) {
-                    try keyboardController.typeText(text, targetPID: pid)
-                }
-                await MainActor.run { focusStealPreventer.start(targetPID: pid) }
-                return .text("Typed \(text.count) characters (synthetic focus)")
+                try keyboardController.typeText(text)
+                return .text("Typed \(text.count) characters")
             } catch {
-                await MainActor.run { focusStealPreventer.start(targetPID: pid) }
                 return .error("Type failed: \(error)")
             }
         }
 
-        // Strategy 3: CGEvent keyboard via postToPid (no target app set)
+        // Multi-tier keyboard input strategy:
+        //
+        // Tier 1: Synthetic focus + HID keyboard (most reliable across all app types)
+        //         Works for Electron, Chromium, native apps. Simulates real keystrokes
+        //         that go through the full event processing pipeline.
+        //
+        // Tier 2: AX set_value on focused element (zero activation fallback)
+        //         Only used if HID fails. Fast but some UI frameworks (Chrome, some React)
+        //         don't update internal state from AX value changes.
+
+        // Tier 1: Synthetic focus + HID keyboard
+        await MainActor.run { focusStealPreventer.stop() }
         do {
-            try keyboardController.typeText(text)
-            return .text("Typed \(text.count) characters")
+            try syntheticFocusEnforcer.withSyntheticFocus(targetPID: pid) {
+                try keyboardController.typeText(text, targetPID: nil)  // HID, not postToPid
+            }
+            await MainActor.run { focusStealPreventer.start(targetPID: pid) }
+            return .text("Typed \(text.count) characters via HID (synthetic focus)")
         } catch {
-            return .error("Type failed: \(error)")
+            await MainActor.run { focusStealPreventer.start(targetPID: pid) }
         }
+
+        // Tier 2: AX set_value fallback
+        let appElement = AXUIElement.applicationElement(pid: pid)
+        if let focusedElement: AXUIElement = appElement.attribute(kAXFocusedUIElementAttribute) {
+            let role = focusedElement.role ?? ""
+            let textRoles = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+            if textRoles.contains(role) {
+                let currentValue = focusedElement.axValue ?? ""
+                let newValue = currentValue + text
+                let result = AXUIElementSetAttributeValue(
+                    focusedElement,
+                    kAXValueAttribute as CFString,
+                    newValue as CFTypeRef
+                )
+                if result == .success {
+                    return .text("Typed \(text.count) characters via AX set_value (background)")
+                }
+            }
+        }
+
+        return .error("Type failed: all strategies exhausted")
     }
 
     // MARK: - press_key
 
     public func pressKey(_ keySpec: String) async -> ToolResult {
+        // Tier 0: Menu shortcut via AX (zero activation, most reliable)
         if let pid = targetAppPID, keySpec.lowercased().hasPrefix("super+") {
             let menuResult = await tryMenuShortcut(pid: pid, keySpec: keySpec)
             if let result = menuResult { return result }
         }
 
-        // Use synthetic focus for background apps (Electron needs NSApp.isActive)
-        if let pid = targetAppPID {
-            await MainActor.run { focusStealPreventer.stop() }
+        guard let pid = targetAppPID else {
             do {
-                try syntheticFocusEnforcer.withSyntheticFocus(targetPID: pid) {
-                    try keyboardController.pressKey(keySpec, targetPID: pid)
-                }
-                await MainActor.run { focusStealPreventer.start(targetPID: pid) }
-                return .text("Pressed key: \(keySpec) (synthetic focus)")
+                try keyboardController.pressKey(keySpec)
+                return .text("Pressed key: \(keySpec)")
             } catch {
-                await MainActor.run { focusStealPreventer.start(targetPID: pid) }
                 return .error("Key press failed: \(error)")
             }
         }
 
+        // Tier 1: Synthetic focus + HID keyboard
+        // Use HID (.cghidEventTap) instead of postToPid — Electron needs full HID processing.
+        await MainActor.run { focusStealPreventer.stop() }
         do {
-            try keyboardController.pressKey(keySpec)
-            return .text("Pressed key: \(keySpec)")
+            try syntheticFocusEnforcer.withSyntheticFocus(targetPID: pid) {
+                try keyboardController.pressKey(keySpec, targetPID: nil)  // HID, not postToPid
+            }
+            await MainActor.run { focusStealPreventer.start(targetPID: pid) }
+            return .text("Pressed key: \(keySpec) (synthetic focus)")
         } catch {
+            await MainActor.run { focusStealPreventer.start(targetPID: pid) }
             return .error("Key press failed: \(error)")
         }
     }
