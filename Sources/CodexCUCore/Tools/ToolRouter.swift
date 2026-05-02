@@ -177,9 +177,10 @@ public actor ToolRouter {
                 return .text("Clicked at (\(Int(point.x)), \(Int(point.y))) \(button.rawValue) (background)")
             }
 
-            // Strategy 4: SyntheticAppFocusEnforcer — ultra-fast real activation
-            // with visual masking (user windows raised to popUpMenu level).
-            // Required for Electron apps that need real NSApp activation.
+            // Strategy 4: SyntheticAppFocusEnforcer — CPS-level focus change.
+            // Zero visual disruption, zero window movement.
+            // Must disable FocusStealPreventer during this — otherwise it detects
+            // the CPS change and immediately restores focus, canceling our click.
             if let pid = targetAppPID {
                 var clickPoint = point
                 if case .index(let idx) = target,
@@ -187,16 +188,18 @@ public actor ToolRouter {
                     clickPoint = center
                 }
 
-                try await MainActor.run {
-                    try syntheticFocusEnforcer.click(
-                        at: clickPoint,
-                        targetPID: pid,
-                        windowNumber: nil,
-                        button: button,
-                        clickCount: clickCount,
-                        mouseController: mouseController
-                    )
-                }
+                await MainActor.run { focusStealPreventer.stop() }
+
+                try syntheticFocusEnforcer.click(
+                    at: clickPoint,
+                    targetPID: pid,
+                    windowNumber: nil,
+                    button: button,
+                    clickCount: clickCount,
+                    mouseController: mouseController
+                )
+
+                await MainActor.run { focusStealPreventer.start(targetPID: pid) }
 
                 return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(button.rawValue) x\(clickCount) (synthetic focus)")
             }
@@ -402,15 +405,13 @@ public actor ToolRouter {
     // MARK: - Synthetic Focus Activation
 
     /// Execute an action with synthetic focus on the target app.
-    /// Uses SyntheticAppFocusEnforcer for visually masked real activation.
+    /// Uses CPS-level focus change — zero visual disruption.
     private func withSyntheticActivation(_ action: @Sendable () throws -> Void) async throws {
         guard let pid = targetAppPID else {
             try action()
             return
         }
-        try await MainActor.run {
-            try syntheticFocusEnforcer.withSyntheticFocus(targetPID: pid, action: action)
-        }
+        try syntheticFocusEnforcer.withSyntheticFocus(targetPID: pid, action: action)
     }
 
     // MARK: - Focus Guard

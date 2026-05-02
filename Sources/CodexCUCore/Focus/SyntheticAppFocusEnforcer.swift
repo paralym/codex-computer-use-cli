@@ -2,133 +2,122 @@ import ApplicationServices
 import AppKit
 import CoreGraphics
 
-// MARK: - Private CGS API
+// MARK: - Private API
 
-private let _cgsSetWindowLevel: (@convention(c) (Int32, UInt32, Int32) -> Int32)? = {
-    guard let h = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY),
-          let s = dlsym(h, "CGSSetWindowLevel") else { return nil }
-    return unsafeBitCast(s, to: (@convention(c) (Int32, UInt32, Int32) -> Int32).self)
-}()
+@_silgen_name("GetProcessForPID")
+private func _getProcessForPID(_ pid: pid_t, _ psn: UnsafeMutableRawPointer) -> Int32
 
-private let _cgsMainConnectionID: (@convention(c) () -> Int32)? = {
-    guard let h = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY),
-          let s = dlsym(h, "CGSMainConnectionID") else { return nil }
-    return unsafeBitCast(s, to: (@convention(c) () -> Int32).self)
+@_silgen_name("GetFrontProcess")
+private func _getFrontProcess(_ psn: UnsafeMutableRawPointer) -> Int16
+
+/// ProcessSerialNumber layout — matches Carbon's PSN struct.
+private struct PSN {
+    var highLongOfPSN: UInt32 = 0
+    var lowLongOfPSN: UInt32 = 0
+}
+
+/// Private SkyLight API — changes the CPS-level front process.
+/// Sends kCPSNotifyNewFront to the target app, making its AppKit layer
+/// set NSApp.isActive = true. Unlike NSRunningApplication.activate(),
+/// this does NOT change window ordering or the menu bar.
+private let _slpsSetFrontProcessWithOptions: (@convention(c) (UnsafeMutableRawPointer, UInt32) -> Int32)? = {
+    guard let handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY),
+          let sym = dlsym(handle, "_SLPSSetFrontProcessWithOptions") else { return nil }
+    return unsafeBitCast(sym, to: (@convention(c) (UnsafeMutableRawPointer, UInt32) -> Int32).self)
 }()
 
 // MARK: - SyntheticAppFocusEnforcer
 
 /// Makes a target app process HID events (including Electron double-click)
-/// with minimal visual disruption. Inspired by Codex's SyntheticAppFocusEnforcer.
+/// with zero visual disruption. Replicates Codex's SyntheticAppFocusEnforcer.
 ///
 /// ## How it works
 ///
-/// Electron/Chromium apps require real NSApp activation to process HID events.
-/// This class performs ultra-fast activation with visual masking:
+/// Uses the private SkyLight API `_SLPSSetFrontProcessWithOptions` to change
+/// the CPS (Core Policy Server) level front process. This makes the target
+/// app believe it's active (`NSApp.isActive = true`) WITHOUT:
+/// - Changing window ordering (no z-order change)
+/// - Changing the menu bar
+/// - Any visual disruption whatsoever
 ///
-/// 1. **Mask**: Raise ALL user windows to `kCGPopUpMenuWindowLevel` (25).
-///    This is above the menu bar (24), so user's windows cover EVERYTHING.
-/// 2. **Activate**: `NSRunningApplication.activate()` on the target app.
-///    The target window goes behind the user's raised windows — invisible.
-/// 3. **Act**: Deliver mouse/keyboard events. The target processes them
-///    because it's truly active at the AppKit level.
-/// 4. **Restore**: Re-activate user's app, lower windows to normal level.
-///    Total target-active time: ~50ms.
+/// Flow:
+/// 1. Save current front process PSN
+/// 2. `_SLPSSetFrontProcessWithOptions(&targetPSN, 0)` — target thinks it's active
+/// 3. Wait 20ms for CPS notification to propagate to Electron's event loop
+/// 4. Deliver HID mouse events via `CGEvent.post(tap: .cghidEventTap)`
+/// 5. Wait 50ms for events to be processed
+/// 6. `_SLPSSetFrontProcessWithOptions(&frontPSN, 0)` — restore original front
 ///
-/// ## Why real activation is needed
+/// Total cycle: ~120ms. Zero visual change. Zero flicker.
 ///
-/// Tested alternatives that DON'T work for Electron double-click:
-/// - `_SLPSSetFrontProcessWithOptions` (changes CPS front but Electron still ignores events)
-/// - `kAXFrontmostAttribute = true` (causes actual activation with no restore)
-/// - `postToPid` without activation (Electron ignores background events)
-/// - NSEvent(windowNumber:) without activation (Electron checks NSApp.isActive)
+/// ## Key finding
 ///
-/// Only real `NSRunningApplication.activate()` makes Electron accept HID events.
-///
-/// ## Codex's approach
-///
-/// The Codex binary uses `SyntheticAppFocusEnforcer` with:
-/// - An overlay window (ComputerUseCursor) at a high level that covers everything
-/// - `setIgnoresMouseEvents:true` so events pass through the overlay
-/// - `orderFrontRegardless` to keep the overlay on top during activation changes
-/// This overlay hides the activation/restore cycle completely.
-///
-/// Our approach uses the same principle but raises the user's existing windows
-/// instead of an overlay, achieving a similar visual masking effect.
+/// `_SLPSSetFrontProcessWithOptions` with 20ms+ wait DOES make Electron
+/// process HID events. Earlier tests with 5ms failed because the CPS
+/// notification hadn't propagated to Electron's Chromium event loop yet.
+/// 20ms is the minimum reliable wait time.
 public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
 
     public init() {}
 
-    /// Perform an action on a target app with visual masking.
+    // MARK: - Core: Synthetic Focus
+
+    /// Temporarily make the target app the CPS-level front process,
+    /// perform an action, then restore the original front process.
     ///
-    /// The target app is briefly activated (~50ms), during which the user's
-    /// windows are raised above everything to hide the change.
-    ///
-    /// - Parameters:
-    ///   - targetPID: The target app's process ID
-    ///   - action: Closure executed while target is active
+    /// Zero visual disruption — no window movement, no menu bar change.
     @discardableResult
     public func withSyntheticFocus(targetPID: pid_t, action: () throws -> Void) rethrows -> Bool {
-        // Get user's frontmost app
-        let userApp = NSWorkspace.shared.frontmostApplication
-        guard let userApp = userApp, userApp.processIdentifier != targetPID else {
-            // Target is already frontmost — just run action
-            try action()
-            return true
-        }
-
-        let targetApp = NSWorkspace.shared.runningApplications
-            .first { $0.processIdentifier == targetPID }
-        guard let targetApp = targetApp else {
+        guard let slpsSetFront = _slpsSetFrontProcessWithOptions else {
+            // Private API not available — run action without synthetic focus
             try action()
             return false
         }
 
-        // Collect user's on-screen windows
-        let windowList = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
-        ) as? [[String: Any]] ?? []
+        var targetPSN = PSN()
+        var frontPSN = PSN()
 
-        let userWindowIDs = windowList
-            .filter { ($0[kCGWindowOwnerPID as String] as? Int32) == userApp.processIdentifier }
-            .compactMap { $0[kCGWindowNumber as String] as? UInt32 }
-
-        let connID = _cgsMainConnectionID?() ?? 0
-
-        // --- Phase 1: MASK — raise user windows above everything ---
-        if connID != 0, let setLevel = _cgsSetWindowLevel {
-            for wid in userWindowIDs {
-                // kCGPopUpMenuWindowLevel (25) is above the menu bar (24)
-                _ = setLevel(connID, wid, 25)
-            }
+        guard _getProcessForPID(targetPID, &targetPSN) == 0 else {
+            try action()
+            return false
+        }
+        guard _getFrontProcess(&frontPSN) == 0 else {
+            try action()
+            return false
         }
 
-        // --- Phase 2: ACTIVATE target ---
-        targetApp.activate()
-        usleep(10000) // 10ms — minimum for activation to take effect
+        // Already front — just run action
+        if targetPSN.highLongOfPSN == frontPSN.highLongOfPSN
+            && targetPSN.lowLongOfPSN == frontPSN.lowLongOfPSN {
+            try action()
+            return true
+        }
 
-        // --- Phase 3: ACT ---
+        // --- Phase 1: CPS-level activate ---
+        // Target receives kCPSNotifyNewFront → NSApp.isActive = true
+        // No window ordering change, no menu bar change.
+        _ = slpsSetFront(&targetPSN, 0)
+
+        // 20ms for CPS notification to propagate through:
+        // WindowServer → Mach IPC → Chromium browser process → renderer
+        usleep(20000)
+
+        // --- Phase 2: Execute action ---
         defer {
-            // --- Phase 4: RESTORE ---
-            usleep(20000) // 20ms for events to be processed
+            // --- Phase 3: Restore ---
+            usleep(50000) // 50ms for events to be fully processed
 
-            userApp.activate()
-            usleep(50000) // 50ms for restoration to take effect
-
-            // Restore user window levels
-            if connID != 0, let setLevel = _cgsSetWindowLevel {
-                for wid in userWindowIDs {
-                    _ = setLevel(connID, wid, 0) // kCGNormalWindowLevel
-                }
-            }
+            _ = slpsSetFront(&frontPSN, 0)
         }
 
         try action()
         return true
     }
 
-    /// Perform a click on a target app using synthetic focus with visual masking.
-    /// Handles cursor save/restore and event delivery.
+    // MARK: - Convenience: Click
+
+    /// Perform a click on a target app using CPS-level synthetic focus.
+    /// Zero visual disruption — no flicker, no window movement.
     public func click(
         at point: CGPoint,
         targetPID: pid_t,
@@ -143,11 +132,9 @@ public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
             CGWarpMouseCursorPosition(point)
             CGAssociateMouseAndMouseCursorPosition(1)
 
-            // Use plain CGEvent for clicks (works when app is active)
             try mouseController.click(at: point, button: button, clickCount: clickCount)
         }
 
-        // Restore cursor
         CGWarpMouseCursorPosition(savedPos)
         CGAssociateMouseAndMouseCursorPosition(1)
     }
