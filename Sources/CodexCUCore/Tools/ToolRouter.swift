@@ -147,21 +147,13 @@ public actor ToolRouter {
             return .error("Click failed: \(error)")
         }
 
-        // Show virtual cursor moving to target position
-        await MainActor.run {
-            let c = ComputerUseCursor.shared
-            c.show()
-            c.moveTo(clickPoint, animated: true)
-        }
-        try? await Task.sleep(for: .milliseconds(180))
-        await MainActor.run { ComputerUseCursor.shared.pulseClick() }
-
         // Strategy 1: AX action (zero activation) — only for single left-clicks
         if case .index(let idx) = target, button == .left, clickCount == 1 {
             let success = await skyshotCapture.tryClickAction(atIndex: idx)
             if success {
                 await guardFocusAfterAXAction()
-                await hideCursorAfterDelay()
+                // Virtual cursor disabled — target app is in background, cursor would appear
+                // on the wrong window. Enable when fog overlay (FogCursorStyle) is implemented.
                 return .text("Clicked element \(idx) via AX (background)")
             }
         }
@@ -177,7 +169,8 @@ public actor ToolRouter {
                         if el.actionNames.contains(action) {
                             if (try? el.performAction(action)) != nil {
                                 await guardFocusAfterAXAction()
-                                await hideCursorAfterDelay()
+                                // Virtual cursor disabled — target app is in background, cursor would appear
+                // on the wrong window. Enable when fog overlay (FogCursorStyle) is implemented.
                                 return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) via AX hit-test (background)")
                             }
                         }
@@ -191,7 +184,8 @@ public actor ToolRouter {
         if clickCount == 1 {
             do {
                 try mouseController.click(at: clickPoint, button: button, clickCount: 1, targetPID: targetAppPID)
-                await hideCursorAfterDelay()
+                // Virtual cursor disabled — target app is in background, cursor would appear
+                // on the wrong window. Enable when fog overlay (FogCursorStyle) is implemented.
                 return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(button.rawValue) (background)")
             } catch {
                 return .error("Click failed: \(error)")
@@ -199,6 +193,7 @@ public actor ToolRouter {
         }
 
         // Strategy 4: SyntheticAppFocusEnforcer — frozen overlay + CPS-level focus change.
+        // Virtual cursor shown AFTER overlay removed (so it appears on the real screen).
         // Must disable FocusStealPreventer during this.
         if let pid = targetAppPID {
             await MainActor.run { focusStealPreventer.stop() }
@@ -214,28 +209,39 @@ public actor ToolRouter {
                 )
             } catch {
                 await MainActor.run { focusStealPreventer.start(targetPID: pid) }
-                await hideCursorAfterDelay()
                 return .error("Click failed: \(error)")
             }
 
             await MainActor.run { focusStealPreventer.start(targetPID: pid) }
-            await hideCursorAfterDelay()
+
+            // Show cursor AFTER overlay is removed — user sees it on the real screen
+            // Virtual cursor disabled — target app is in background, cursor would appear
+                // on the wrong window. Enable when fog overlay (FogCursorStyle) is implemented.
             return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(button.rawValue) x\(clickCount) (synthetic focus)")
         }
 
         // No target PID — global click
         do {
             try mouseController.click(at: clickPoint, button: button, clickCount: clickCount)
-            await hideCursorAfterDelay()
+            // Virtual cursor disabled — target app is in background, cursor would appear
+                // on the wrong window. Enable when fog overlay (FogCursorStyle) is implemented.
             return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(button.rawValue) x\(clickCount)")
         } catch {
             return .error("Click failed: \(error)")
         }
     }
 
-    /// Hide the virtual cursor after a brief delay (lets user see the pulse animation)
-    private func hideCursorAfterDelay() async {
-        try? await Task.sleep(for: .milliseconds(300))
+    /// Show virtual cursor at the click position, pulse, then hide after delay.
+    /// For Strategy 4 (synthetic focus), this is called AFTER the overlay is removed
+    /// so the cursor appears on the real screen, not the frozen screenshot.
+    private func showCursorAt(_ point: CGPoint) async {
+        await MainActor.run {
+            let c = ComputerUseCursor.shared
+            c.show()
+            c.moveTo(point, animated: false)
+            c.pulseClick()
+        }
+        try? await Task.sleep(for: .milliseconds(1500))
         await MainActor.run { ComputerUseCursor.shared.hide() }
     }
 

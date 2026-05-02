@@ -70,9 +70,10 @@ public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
         // Phase 1: Frozen screenshot overlay
         showFrozenOverlay()
 
-        // Phase 2: Hide cursor
+        // Phase 2: Hide cursor + disconnect cursor from mouse position
         let savedPos = CGEvent(source: nil)?.location ?? .zero
         CGDisplayHideCursor(CGMainDisplayID())
+        CGAssociateMouseAndMouseCursorPosition(0) // HID events won't move visible cursor
 
         // Phase 3: CPS activate (changes invisible behind frozen overlay)
         _ = slpsSetFront(&targetPSN, 0)
@@ -82,20 +83,20 @@ public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
             // Phase 5: Restore
             usleep(50000)
 
-            // Restore cursor
-            CGWarpMouseCursorPosition(savedPos)
-            CGAssociateMouseAndMouseCursorPosition(1)
-            CGDisplayShowCursor(CGMainDisplayID())
-
-            // Restore CPS front
+            // Restore CPS front FIRST (before showing cursor)
             _ = slpsSetFront(&frontPSN, 0)
             usleep(50000)
+
+            // Reconnect cursor, warp back to saved position, show
+            CGAssociateMouseAndMouseCursorPosition(1)
+            CGWarpMouseCursorPosition(savedPos)
+            CGDisplayShowCursor(CGMainDisplayID())
 
             // Remove overlay
             hideFrozenOverlay()
         }
 
-        // Phase 4: Execute action (cursor hidden, overlay covers screen)
+        // Phase 4: Execute action (cursor hidden + disconnected, overlay covers screen)
         try action()
         return true
     }
