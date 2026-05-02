@@ -192,9 +192,8 @@ public actor ToolRouter {
             }
         }
 
-        // Strategy 4: SyntheticAppFocusEnforcer — frozen overlay + CPS-level focus change.
-        // Virtual cursor shown AFTER overlay removed (so it appears on the real screen).
-        // Must disable FocusStealPreventer during this.
+        // Strategy 4: SyntheticAppFocusEnforcer — frozen screenshot overlay +
+        // CPS-level focus change + hidden cursor. Zero visual disruption.
         if let pid = targetAppPID {
             await MainActor.run { focusStealPreventer.stop() }
 
@@ -213,10 +212,6 @@ public actor ToolRouter {
             }
 
             await MainActor.run { focusStealPreventer.start(targetPID: pid) }
-
-            // Show cursor AFTER overlay is removed — user sees it on the real screen
-            // Virtual cursor disabled — target app is in background, cursor would appear
-                // on the wrong window. Enable when fog overlay (FogCursorStyle) is implemented.
             return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(button.rawValue) x\(clickCount) (synthetic focus)")
         }
 

@@ -27,20 +27,13 @@ private let _slpsSetFrontProcessWithOptions: (@convention(c) (UnsafeMutableRawPo
 // MARK: - SyntheticAppFocusEnforcer
 
 /// Makes a target app process HID events (including Electron double-click)
-/// with zero visual disruption. Replicates Codex's SyntheticAppFocusEnforcer.
+/// with zero visual disruption.
 ///
-/// ## How it works (frozen-screen overlay)
-///
-/// 1. **Freeze**: Screenshot the entire display, show it as an opaque overlay
-///    at `kCGPopUpMenuWindowLevel` (101). The user sees a frozen screen.
-/// 2. **Hide cursor**: `CGDisplayHideCursor` so cursor warp is invisible.
-/// 3. **CPS activate**: `_SLPSSetFrontProcessWithOptions` makes the target
-///    the CPS-level front process. Window ordering changes happen BEHIND
-///    the frozen screenshot — completely invisible.
-/// 4. **Click**: Warp cursor to target position, deliver HID events.
-///    Cursor is hidden so movement is invisible.
-/// 5. **Restore**: Restore cursor position, show cursor, restore CPS front,
-///    remove overlay. Total cycle: ~200ms.
+/// 1. Screenshot entire display → show as opaque overlay at level 101
+/// 2. Hide real cursor + disconnect from mouse position
+/// 3. CPS activate via `_SLPSSetFrontProcessWithOptions`
+/// 4. Click (cursor hidden, overlay covers screen)
+/// 5. Restore CPS, cursor, remove overlay
 public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
 
     private var _overlayWindow: NSWindow?
@@ -70,38 +63,49 @@ public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
         // Phase 1: Frozen screenshot overlay
         showFrozenOverlay()
 
-        // Phase 2: Hide cursor + disconnect cursor from mouse position
+        // Phase 2: Hide cursor + disconnect
         let savedPos = CGEvent(source: nil)?.location ?? .zero
         CGDisplayHideCursor(CGMainDisplayID())
-        CGAssociateMouseAndMouseCursorPosition(0) // HID events won't move visible cursor
+        CGAssociateMouseAndMouseCursorPosition(0)
 
-        // Phase 3: CPS activate (changes invisible behind frozen overlay)
+        // Phase 3: CPS activate
         _ = slpsSetFront(&targetPSN, 0)
-        usleep(50000) // 50ms for CPS notification
+        usleep(50000)
 
         defer {
-            // Phase 5: Restore
             usleep(50000)
-
-            // Restore CPS front FIRST (before showing cursor)
             _ = slpsSetFront(&frontPSN, 0)
             usleep(50000)
 
-            // Reconnect cursor, warp back to saved position, show
             CGAssociateMouseAndMouseCursorPosition(1)
             CGWarpMouseCursorPosition(savedPos)
             CGDisplayShowCursor(CGMainDisplayID())
 
-            // Remove overlay
             hideFrozenOverlay()
         }
 
-        // Phase 4: Execute action (cursor hidden + disconnected, overlay covers screen)
         try action()
         return true
     }
 
-    // MARK: - Frozen Overlay
+    // MARK: - Convenience
+
+    public func click(
+        at point: CGPoint,
+        targetPID: pid_t,
+        windowNumber: CGWindowID?,
+        button: MouseButton = .left,
+        clickCount: Int = 1,
+        mouseController: MouseController
+    ) throws {
+        try withSyntheticFocus(targetPID: targetPID) {
+            CGWarpMouseCursorPosition(point)
+            CGAssociateMouseAndMouseCursorPosition(1)
+            try mouseController.click(at: point, button: button, clickCount: clickCount)
+        }
+    }
+
+    // MARK: - Overlay
 
     private func showFrozenOverlay() {
         if Thread.isMainThread {
@@ -125,8 +129,6 @@ public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
 
     @MainActor
     private func _showFrozenOverlay() {
-        // Capture current screen
-        // CGWindowListCreateImage: opts=1 (onScreenOnly), imgOpts=1 (bestResolution)
         guard let screenshot = _cgWindowListCreateImage(.null, 1, 0, 1),
               let screen = NSScreen.main else { return }
 
@@ -152,33 +154,12 @@ public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
         imageView.image = NSImage(cgImage: screenshot, size: screen.frame.size)
         imageView.imageScaling = .scaleAxesIndependently
         w.contentView = imageView
-
         w.orderFrontRegardless()
-
-        // Ensure compositor renders the frozen frame before we proceed
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
     }
 
     @MainActor
     private func _hideFrozenOverlay() {
         _overlayWindow?.orderOut(nil)
-    }
-
-    // MARK: - Convenience
-
-    public func click(
-        at point: CGPoint,
-        targetPID: pid_t,
-        windowNumber: CGWindowID?,
-        button: MouseButton = .left,
-        clickCount: Int = 1,
-        mouseController: MouseController
-    ) throws {
-        try withSyntheticFocus(targetPID: targetPID) {
-            // Warp cursor (hidden) and click
-            CGWarpMouseCursorPosition(point)
-            CGAssociateMouseAndMouseCursorPosition(1)
-            try mouseController.click(at: point, button: button, clickCount: clickCount)
-        }
     }
 }
