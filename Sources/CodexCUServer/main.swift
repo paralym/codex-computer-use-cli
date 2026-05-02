@@ -53,11 +53,9 @@ func errText(_ msg: String) -> CallTool.Result {
     .init(content: [.text(text: msg, annotations: nil, _meta: nil)], isError: true)
 }
 
-// MARK: - Server startup
+// MARK: - Server setup
 
 fputs("[MCP] codex-computer-use server starting\n", stderr)
-
-// NSApplication.shared will be initialized lazily when needed (e.g., ScreenCaptureKit)
 
 let router = ToolRouter()
 
@@ -79,7 +77,7 @@ let tools: [Tool] = [
         "properties": .object(["app_name": .object(["type": .string("string")])]),
         "required": .array([.string("app_name")])
     ])),
-    Tool(name: "get_app_state", description: "Capture screenshot + AX tree. Returns numbered element indices and a screenshot image. Always call before interacting.", inputSchema: .object([
+    Tool(name: "get_app_state", description: "Capture screenshot + AX tree. Returns numbered element indices and a screenshot image. Always call before interacting with an app.", inputSchema: .object([
         "type": .string("object"),
         "properties": .object(["app_name": .object(["type": .string("string")])]),
         "required": .array([.string("app_name")])
@@ -94,7 +92,7 @@ let tools: [Tool] = [
             "click_count": .object(["type": .string("integer")])
         ])
     ])),
-    Tool(name: "type_text", description: "Type text into the focused element. Uses HID keyboard via synthetic focus (works for all app types). Call get_app_state first to set target app.", inputSchema: .object([
+    Tool(name: "type_text", description: "Type text into the focused element. Uses HID keyboard via synthetic focus. Call get_app_state first to set target app.", inputSchema: .object([
         "type": .string("object"),
         "properties": .object(["text": .object(["type": .string("string")])]),
         "required": .array([.string("text")])
@@ -134,8 +132,6 @@ let tools: [Tool] = [
         "required": .array([.string("index"), .string("value")])
     ])),
 ]
-
-// MARK: - Handlers
 
 await server.withMethodHandler(ListTools.self) { _ in
     .init(tools: tools)
@@ -190,16 +186,16 @@ await server.withMethodHandler(CallTool.self) { params in
     }
 }
 
-// MARK: - Start transport
+// MARK: - Start
 
-fputs("[MCP] Listening on stdio\n", stderr)
-let transport = StdioTransport()
-do {
+let serverTask = Task {
+    let transport = StdioTransport()
     try await server.start(transport: transport)
-    fputs("[MCP] server.start() returned, waiting\n", stderr)
+    fputs("[MCP] Server ready\n", stderr)
     await server.waitUntilCompleted()
-    fputs("[MCP] server completed\n", stderr)
-} catch {
-    fputs("[MCP] ERROR: \(error)\n", stderr)
 }
-fputs("[MCP] Exiting\n", stderr)
+
+// Keep main alive while server runs
+while !serverTask.isCancelled {
+    try? await Task.sleep(for: .seconds(1))
+}
