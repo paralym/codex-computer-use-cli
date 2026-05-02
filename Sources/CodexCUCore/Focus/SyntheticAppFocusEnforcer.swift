@@ -88,6 +88,19 @@ public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
         return true
     }
 
+    // MARK: - Visual Protection (overlay only, no CPS)
+
+    /// Show the frozen overlay to prevent visual disruption from AX actions
+    /// that may trigger app activation as a side effect.
+    public func showOverlay() {
+        showFrozenOverlay()
+    }
+
+    /// Hide the frozen overlay after the AX action is complete.
+    public func hideOverlay() {
+        hideFrozenOverlay()
+    }
+
     // MARK: - Convenience
 
     public func click(
@@ -99,9 +112,12 @@ public final class SyntheticAppFocusEnforcer: @unchecked Sendable {
         mouseController: MouseController
     ) throws {
         try withSyntheticFocus(targetPID: targetPID) {
-            // Use postToPid — sends events directly to the process without
-            // going through the HID cursor system, so the real cursor stays put.
-            try mouseController.click(at: point, button: button, clickCount: clickCount, targetPID: targetPID)
+            // Use HID (.cghidEventTap) — goes through the normal event routing system
+            // which Electron fully supports. The cursor is hidden during synthetic focus
+            // and warped back to the saved position before being shown again, so the user
+            // doesn't see any cursor movement. postToPid is insufficient for Electron apps
+            // that require full HID event processing.
+            try mouseController.click(at: point, button: button, clickCount: clickCount, targetPID: nil)
         }
     }
 

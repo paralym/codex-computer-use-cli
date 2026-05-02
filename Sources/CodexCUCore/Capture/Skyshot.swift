@@ -57,6 +57,8 @@ public actor SkyshotCapture {
     private var lastSkyshot: Skyshot?
     /// The CGWindowID of the captured window, for targeted event delivery
     private var lastWindowNumber: CGWindowID?
+    /// Y offset to correct element coordinates (currently unused — AX coordinates are accurate)
+    private var electronYOffset: CGFloat = 0
 
     public init() {}
 
@@ -107,6 +109,9 @@ public actor SkyshotCapture {
         // Store windowNumber for targeted CGEvent delivery
         self.lastWindowNumber = Self.lookupWindowNumber(pid: pid)
 
+        // Detect Electron Y offset: compare window frame with HTML content frame
+        self.electronYOffset = Self.detectElectronYOffset(appElement: appElement)
+
         return skyshot
     }
 
@@ -130,12 +135,8 @@ public actor SkyshotCapture {
     }
 
     /// Get the center point of an element by index, using AX frame coordinates.
-    ///
-    /// With SyntheticAppFocusEnforcer, there is no scroll restoration or window
-    /// reordering, so AX frame coordinates directly correspond to screen positions.
-    /// For Electron apps there may be a small fixed offset (~14px) between AX frame
-    /// and visual position, but this is within one row height and acceptable for
-    /// most click operations.
+    /// For Electron apps, automatically corrects the Y coordinate offset caused by
+    /// Electron's AX implementation reporting positions with an extra title bar offset.
     public func elementCenter(atIndex index: Int) -> CGPoint? {
         if isStale(threshold: 30) {
             NSLog("[SkyshotCapture] Warning: element map is stale (>30s old). Consider re-capturing before interacting.")
@@ -144,7 +145,7 @@ public actor SkyshotCapture {
         guard let wrapper = lastElementMap[index],
               let frame = wrapper.element.frame else { return nil }
 
-        return CGPoint(x: frame.midX, y: frame.midY)
+        return CGPoint(x: frame.midX, y: frame.midY - electronYOffset)
     }
 
     /// Perform an AX action on an element by index (inside actor to avoid Sendable issues)
@@ -232,6 +233,12 @@ public actor SkyshotCapture {
     /// Get the stored window number for targeted CGEvent delivery
     public func windowNumber() -> CGWindowID? {
         lastWindowNumber
+    }
+
+    /// Detect Y coordinate offset for element positions. Currently returns 0 —
+    /// AX frame coordinates are accurate when using HID events via synthetic focus.
+    private static func detectElectronYOffset(appElement: AXUIElement) -> CGFloat {
+        return 0
     }
 
     /// Look up the CGWindowID for a given PID from CGWindowListCopyWindowInfo

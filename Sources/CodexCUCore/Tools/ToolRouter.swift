@@ -147,19 +147,29 @@ public actor ToolRouter {
             return .error("Click failed: \(error)")
         }
 
+        // Check if target app is in the background — if so, show overlay to prevent
+        // visual flash in case AXPress triggers app activation (common in Electron apps).
+        let currentTargetPID = targetAppPID
+        let targetIsFrontmost = await MainActor.run {
+            NSWorkspace.shared.frontmostApplication?.processIdentifier == currentTargetPID
+        }
+        let needsOverlay = !targetIsFrontmost && currentTargetPID != nil
+
         // Strategy 1: AX action (zero activation) — only for single left-clicks
         if case .index(let idx) = target, button == .left, clickCount == 1 {
+            if needsOverlay { syntheticFocusEnforcer.showOverlay() }
             let success = await skyshotCapture.tryClickAction(atIndex: idx)
             if success {
                 await guardFocusAfterAXAction()
-                // Virtual cursor disabled — target app is in background, cursor would appear
-                // on the wrong window. Enable when fog overlay (FogCursorStyle) is implemented.
+                if needsOverlay { syntheticFocusEnforcer.hideOverlay() }
                 return .text("Clicked element \(idx) via AX (background)")
             }
+            if needsOverlay { syntheticFocusEnforcer.hideOverlay() }
         }
 
         // Strategy 2: AX hit-test → AXPress (zero activation) — only for single left-clicks
         if button == .left, clickCount == 1, let pid = targetAppPID {
+            if needsOverlay { syntheticFocusEnforcer.showOverlay() }
             let appElement = AXUIElement.applicationElement(pid: pid)
             if let hitElement = appElement.elementAtPosition(clickPoint) {
                 var candidate: AXUIElement? = hitElement
@@ -169,8 +179,7 @@ public actor ToolRouter {
                         if el.actionNames.contains(action) {
                             if (try? el.performAction(action)) != nil {
                                 await guardFocusAfterAXAction()
-                                // Virtual cursor disabled — target app is in background, cursor would appear
-                // on the wrong window. Enable when fog overlay (FogCursorStyle) is implemented.
+                                if needsOverlay { syntheticFocusEnforcer.hideOverlay() }
                                 return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) via AX hit-test (background)")
                             }
                         }
@@ -178,22 +187,12 @@ public actor ToolRouter {
                     candidate = el.parent
                 }
             }
+            if needsOverlay { syntheticFocusEnforcer.hideOverlay() }
         }
 
-        // Strategy 3: CGEvent via postToPid (zero activation for native apps)
-        if clickCount == 1 {
-            do {
-                try mouseController.click(at: clickPoint, button: button, clickCount: 1, targetPID: targetAppPID)
-                // Virtual cursor disabled — target app is in background, cursor would appear
-                // on the wrong window. Enable when fog overlay (FogCursorStyle) is implemented.
-                return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(button.rawValue) (background)")
-            } catch {
-                return .error("Click failed: \(error)")
-            }
-        }
-
-        // Strategy 4: SyntheticAppFocusEnforcer — frozen screenshot overlay +
-        // CPS-level focus change + hidden cursor. Zero visual disruption.
+        // Strategy 3+4: CGEvent via synthetic focus — frozen screenshot overlay +
+        // CPS-level focus change + postToPid. Works for ALL apps including Electron
+        // which requires NSApp.isActive to process CGEvents.
         if let pid = targetAppPID {
             await MainActor.run { focusStealPreventer.stop() }
 
@@ -321,6 +320,32 @@ public actor ToolRouter {
         }
     }
 
+    // MARK: - Direct (foreground) operations — no overlay, no SLPS
+
+    /// Click via direct HID events. Use when app is already frontmost.
+    public func clickDirect(target: ElementTarget, button: MouseButton = .left, clickCount: Int = 1) async -> ToolResult {
+        do {
+            let point = try await resolvePoint(target: target)
+            try mouseController.click(at: point, button: button, clickCount: clickCount)
+            return .text("Clicked at (\(Int(point.x)), \(Int(point.y))) \(button.rawValue) x\(clickCount) (foreground)")
+        } catch {
+            return .error("Click failed: \(error)")
+        }
+    }
+
+    /// Drag via direct HID events. Use when app is already frontmost.
+    public func dragDirect(startX: Double, startY: Double, endX: Double, endY: Double) async -> ToolResult {
+        do {
+            try mouseController.drag(
+                from: CGPoint(x: startX, y: startY),
+                to: CGPoint(x: endX, y: endY)
+            )
+            return .text("Dragged from (\(Int(startX)), \(Int(startY))) to (\(Int(endX)), \(Int(endY))) (foreground)")
+        } catch {
+            return .error("Drag failed: \(error)")
+        }
+    }
+
     // MARK: - type_text
 
     public func typeText(_ text: String) async -> ToolResult {
@@ -344,10 +369,26 @@ public actor ToolRouter {
             }
         }
 
-        // Strategy 2: CGEvent keyboard via postToPid
+        // Strategy 2: CGEvent keyboard via synthetic focus (for Electron apps that need
+        // NSApp.isActive to process keyboard events)
+        if let pid = targetAppPID {
+            await MainActor.run { focusStealPreventer.stop() }
+            do {
+                try syntheticFocusEnforcer.withSyntheticFocus(targetPID: pid) {
+                    try keyboardController.typeText(text, targetPID: pid)
+                }
+                await MainActor.run { focusStealPreventer.start(targetPID: pid) }
+                return .text("Typed \(text.count) characters (synthetic focus)")
+            } catch {
+                await MainActor.run { focusStealPreventer.start(targetPID: pid) }
+                return .error("Type failed: \(error)")
+            }
+        }
+
+        // Strategy 3: CGEvent keyboard via postToPid (no target app set)
         do {
-            try keyboardController.typeText(text, targetPID: targetAppPID)
-            return .text("Typed \(text.count) characters (background)")
+            try keyboardController.typeText(text)
+            return .text("Typed \(text.count) characters")
         } catch {
             return .error("Type failed: \(error)")
         }
@@ -361,9 +402,24 @@ public actor ToolRouter {
             if let result = menuResult { return result }
         }
 
+        // Use synthetic focus for background apps (Electron needs NSApp.isActive)
+        if let pid = targetAppPID {
+            await MainActor.run { focusStealPreventer.stop() }
+            do {
+                try syntheticFocusEnforcer.withSyntheticFocus(targetPID: pid) {
+                    try keyboardController.pressKey(keySpec, targetPID: pid)
+                }
+                await MainActor.run { focusStealPreventer.start(targetPID: pid) }
+                return .text("Pressed key: \(keySpec) (synthetic focus)")
+            } catch {
+                await MainActor.run { focusStealPreventer.start(targetPID: pid) }
+                return .error("Key press failed: \(error)")
+            }
+        }
+
         do {
-            try keyboardController.pressKey(keySpec, targetPID: targetAppPID)
-            return .text("Pressed key: \(keySpec) (background)")
+            try keyboardController.pressKey(keySpec)
+            return .text("Pressed key: \(keySpec)")
         } catch {
             return .error("Key press failed: \(error)")
         }

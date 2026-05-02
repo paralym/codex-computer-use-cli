@@ -10,8 +10,8 @@ A Swift CLI tool that replicates [OpenAI Codex](https://openai.com/index/introdu
 codex-cu screenshot 网易云音乐     # Capture AX tree + screenshot (zero activation)
 codex-cu click 网易云音乐 193      # Single-click element 193 via AXPress (zero activation)
 codex-cu click 网易云音乐 161 --count 2  # Double-click (real activation with visual masking)
-codex-cu type "Hello World"        # Type text into focused element
-codex-cu key "super+c"             # Press key combination (xdotool syntax)
+codex-cu type 网易云音乐 "Hello"   # Type text into app's focused element
+codex-cu key 网易云音乐 "super+c"  # Press key combination to app (xdotool syntax)
 ```
 
 The tool captures a **Skyshot** (Screenshot + AX Tree) of any running app, giving AI models both visual and structural context. It then executes actions on indexed elements without stealing the user's focus.
@@ -41,8 +41,8 @@ codex-cu launch <app>               # Launch an app
 codex-cu activate <app>             # Bring app to foreground
 codex-cu screenshot <app> [--output path]  # Capture Skyshot (AX tree + screenshot)
 codex-cu click <app> <index|x,y> [--button left|right] [--count N]
-codex-cu type <text>                # Type text into focused element
-codex-cu key <spec>                 # Press key (xdotool syntax: super+c, Return, ctrl+shift+a)
+codex-cu type <app> <text>          # Type text into app's focused element
+codex-cu key <app> <spec>           # Press key to app (xdotool syntax: super+c, Return, ctrl+shift+a)
 codex-cu scroll <app> <index|x,y> <up|down|left|right> [--pages N]
 codex-cu drag <x1,y1> <x2,y2>      # Drag between coordinates
 codex-cu set-value <app> <index> <value>  # Set element value via AX

@@ -28,6 +28,7 @@ struct CodexCU: AsyncParsableCommand {
             Scroll.self,
             Drag.self,
             SetValue.self,
+            CursorDemo.self,
         ]
     )
 }
@@ -173,18 +174,31 @@ struct Click: AsyncParsableCommand {
     @Option(name: .long, help: "Click count (1=single, 2=double, 3=triple)")
     var count: Int = 1
 
+    @Flag(name: .long, help: "Activate app to foreground before clicking (use for frontmost-app interactions)")
+    var foreground: Bool = false
+
     func run() async {
         guard ensurePermissions() else { return }
 
         let router = ToolRouter()
 
-        // First capture state to build element index
-        _ = await router.getAppState(appName: appName)
+        if foreground {
+            // Foreground mode: activate app, then direct HID click (no overlay/SLPS)
+            _ = await router.activateApp(name: appName)
+            try? await Task.sleep(for: .milliseconds(300))
 
-        let elementTarget = parseTarget(target)
-        let mouseButton = MouseButton(rawValue: button) ?? .left
-        let result = await router.click(target: elementTarget, button: mouseButton, clickCount: count)
-        printResult(result)
+            let elementTarget = parseTarget(target)
+            let mouseButton = MouseButton(rawValue: button) ?? .left
+            let result = await router.clickDirect(target: elementTarget, button: mouseButton, clickCount: count)
+            printResult(result)
+        } else {
+            // Background mode: synthetic focus with overlay
+            _ = await router.getAppState(appName: appName)
+            let elementTarget = parseTarget(target)
+            let mouseButton = MouseButton(rawValue: button) ?? .left
+            let result = await router.click(target: elementTarget, button: mouseButton, clickCount: count)
+            printResult(result)
+        }
     }
 }
 
@@ -193,8 +207,11 @@ struct Click: AsyncParsableCommand {
 struct Type: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "type",
-        abstract: "Type text into the focused element"
+        abstract: "Type text into an app's focused element"
     )
+
+    @Argument(help: "App name to type into")
+    var appName: String
 
     @Argument(help: "Text to type")
     var text: String
@@ -202,6 +219,8 @@ struct Type: AsyncParsableCommand {
     func run() async {
         guard ensurePermissions() else { return }
         let router = ToolRouter()
+        // Set up target app so postToPid sends events to the correct process
+        _ = await router.getAppState(appName: appName)
         let result = await router.typeText(text)
         printResult(result)
     }
@@ -214,12 +233,17 @@ struct Key: AsyncParsableCommand {
         abstract: "Press a key combination (xdotool syntax)"
     )
 
+    @Argument(help: "App name to send key to")
+    var appName: String
+
     @Argument(help: "Key spec, e.g. 'super+c', 'Return', 'ctrl+shift+a'")
     var keySpec: String
 
     func run() async {
         guard ensurePermissions() else { return }
         let router = ToolRouter()
+        // Set up target app so postToPid sends events to the correct process
+        _ = await router.getAppState(appName: appName)
         let result = await router.pressKey(keySpec)
         printResult(result)
     }
@@ -263,19 +287,34 @@ struct Drag: AsyncParsableCommand {
         abstract: "Drag from one point to another"
     )
 
+    @Argument(help: "App name")
+    var appName: String
+
     @Argument(help: "Start coordinates 'x,y'")
     var from: String
 
     @Argument(help: "End coordinates 'x,y'")
     var to: String
 
+    @Flag(name: .long, help: "Activate app to foreground before dragging")
+    var foreground: Bool = false
+
     func run() async {
         guard ensurePermissions() else { return }
         let (sx, sy) = parseCoordinates(from)
         let (ex, ey) = parseCoordinates(to)
         let router = ToolRouter()
-        let result = await router.drag(startX: sx, startY: sy, endX: ex, endY: ey)
-        printResult(result)
+
+        if foreground {
+            _ = await router.activateApp(name: appName)
+            try? await Task.sleep(for: .milliseconds(300))
+            let result = await router.dragDirect(startX: sx, startY: sy, endX: ex, endY: ey)
+            printResult(result)
+        } else {
+            _ = await router.getAppState(appName: appName)
+            let result = await router.drag(startX: sx, startY: sy, endX: ex, endY: ey)
+            printResult(result)
+        }
     }
 }
 
@@ -302,6 +341,78 @@ struct SetValue: AsyncParsableCommand {
         _ = await router.getAppState(appName: appName)
         let result = await router.setValue(index: index, value: value)
         printResult(result)
+    }
+}
+
+// MARK: - cursor-demo
+
+struct CursorDemo: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "cursor-demo",
+        abstract: "Demo the AI cursor S-curve motion animation"
+    )
+
+    @Option(name: .long, help: "Number of random waypoints (default: 5)")
+    var points: Int = 5
+
+    @Option(name: .long, help: "Arc size 0..1 (default: 0.35)")
+    var arc: Double = 0.35
+
+    @Option(name: .long, help: "Animation duration per segment in seconds (default: 0.4)")
+    var duration: Double = 0.4
+
+    func run() async {
+        guard ensurePermissions() else { return }
+
+        await MainActor.run {
+            let motion = CursorMotion.shared
+            motion.arcSize = CGFloat(arc)
+            motion.duration = duration
+
+            let screen = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let margin: CGFloat = 100
+
+            // Generate random waypoints within screen bounds
+            var waypoints: [CGPoint] = []
+            for _ in 0...points {
+                let x = CGFloat.random(in: margin...(screen.width - margin))
+                let y = CGFloat.random(in: margin...(screen.height - margin))
+                waypoints.append(CGPoint(x: x, y: y))
+            }
+
+            // Show cursor at first point
+            let cursor = ComputerUseCursor.shared
+            cursor.show()
+            cursor.moveTo(waypoints[0], animated: false)
+
+            print("Cursor motion demo: \(points) waypoints, arc=\(arc), duration=\(duration)s")
+            print("Press Ctrl+C to stop")
+
+            // Animate through waypoints
+            var delay: TimeInterval = 0.3
+            for i in 1..<waypoints.count {
+                let from = waypoints[i - 1]
+                let to = waypoints[i]
+                let segDelay = delay
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + segDelay) {
+                    motion.animate(from: from, to: to) {
+                        cursor.pulseClick()
+                    }
+                }
+                delay += duration + 0.5
+            }
+
+            // Hide cursor after all animations
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay + 1.0) {
+                cursor.hide()
+            }
+        }
+
+        // Keep process alive for animation to complete
+        let totalWait = duration * Double(points) + Double(points) * 0.5 + 2.0
+        try? await Task.sleep(for: .seconds(totalWait))
+        print("Demo complete")
     }
 }
 
