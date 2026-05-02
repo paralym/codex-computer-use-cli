@@ -139,57 +139,71 @@ public actor ToolRouter {
     // MARK: - click
 
     public func click(target: ElementTarget, button: MouseButton = .left, clickCount: Int = 1) async -> ToolResult {
+        // Resolve click point early for cursor animation
+        let clickPoint: CGPoint
+        do {
+            clickPoint = try await resolvePoint(target: target)
+        } catch {
+            return .error("Click failed: \(error)")
+        }
+
+        // Show virtual cursor moving to target position
+        await MainActor.run {
+            let c = ComputerUseCursor.shared
+            c.show()
+            c.moveTo(clickPoint, animated: true)
+        }
+        try? await Task.sleep(for: .milliseconds(180))
+        await MainActor.run { ComputerUseCursor.shared.pulseClick() }
+
         // Strategy 1: AX action (zero activation) — only for single left-clicks
         if case .index(let idx) = target, button == .left, clickCount == 1 {
             let success = await skyshotCapture.tryClickAction(atIndex: idx)
             if success {
                 await guardFocusAfterAXAction()
+                await hideCursorAfterDelay()
                 return .text("Clicked element \(idx) via AX (background)")
             }
         }
 
         // Strategy 2: AX hit-test → AXPress (zero activation) — only for single left-clicks
-        do {
-            let point = try await resolvePoint(target: target)
-            if button == .left, clickCount == 1, let pid = targetAppPID {
-                let appElement = AXUIElement.applicationElement(pid: pid)
-                if let hitElement = appElement.elementAtPosition(point) {
-                    var candidate: AXUIElement? = hitElement
-                    for _ in 0..<4 {
-                        guard let el = candidate else { break }
-                        for action in ["AXPress", "AXOpen", "AXConfirm"] {
-                            if el.actionNames.contains(action) {
-                                if (try? el.performAction(action)) != nil {
-                                    await guardFocusAfterAXAction()
-                                    return .text("Clicked at (\(Int(point.x)), \(Int(point.y))) via AX hit-test (background)")
-                                }
+        if button == .left, clickCount == 1, let pid = targetAppPID {
+            let appElement = AXUIElement.applicationElement(pid: pid)
+            if let hitElement = appElement.elementAtPosition(clickPoint) {
+                var candidate: AXUIElement? = hitElement
+                for _ in 0..<4 {
+                    guard let el = candidate else { break }
+                    for action in ["AXPress", "AXOpen", "AXConfirm"] {
+                        if el.actionNames.contains(action) {
+                            if (try? el.performAction(action)) != nil {
+                                await guardFocusAfterAXAction()
+                                await hideCursorAfterDelay()
+                                return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) via AX hit-test (background)")
                             }
                         }
-                        candidate = el.parent
                     }
+                    candidate = el.parent
                 }
             }
+        }
 
-            // Strategy 3: CGEvent via postToPid (zero activation for native apps)
-            // For single clicks, postToPid works on most native apps
-            if clickCount == 1 {
-                try mouseController.click(at: point, button: button, clickCount: 1, targetPID: targetAppPID)
-                return .text("Clicked at (\(Int(point.x)), \(Int(point.y))) \(button.rawValue) (background)")
+        // Strategy 3: CGEvent via postToPid (zero activation for native apps)
+        if clickCount == 1 {
+            do {
+                try mouseController.click(at: clickPoint, button: button, clickCount: 1, targetPID: targetAppPID)
+                await hideCursorAfterDelay()
+                return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(button.rawValue) (background)")
+            } catch {
+                return .error("Click failed: \(error)")
             }
+        }
 
-            // Strategy 4: SyntheticAppFocusEnforcer — CPS-level focus change.
-            // Zero visual disruption, zero window movement.
-            // Must disable FocusStealPreventer during this — otherwise it detects
-            // the CPS change and immediately restores focus, canceling our click.
-            if let pid = targetAppPID {
-                var clickPoint = point
-                if case .index(let idx) = target,
-                   let center = await skyshotCapture.elementCenter(atIndex: idx) {
-                    clickPoint = center
-                }
+        // Strategy 4: SyntheticAppFocusEnforcer — frozen overlay + CPS-level focus change.
+        // Must disable FocusStealPreventer during this.
+        if let pid = targetAppPID {
+            await MainActor.run { focusStealPreventer.stop() }
 
-                await MainActor.run { focusStealPreventer.stop() }
-
+            do {
                 try syntheticFocusEnforcer.click(
                     at: clickPoint,
                     targetPID: pid,
@@ -198,18 +212,31 @@ public actor ToolRouter {
                     clickCount: clickCount,
                     mouseController: mouseController
                 )
-
+            } catch {
                 await MainActor.run { focusStealPreventer.start(targetPID: pid) }
-
-                return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(button.rawValue) x\(clickCount) (synthetic focus)")
+                await hideCursorAfterDelay()
+                return .error("Click failed: \(error)")
             }
 
-            // No target PID — global click
-            try mouseController.click(at: point, button: button, clickCount: clickCount)
-            return .text("Clicked at (\(Int(point.x)), \(Int(point.y))) \(button.rawValue) x\(clickCount)")
+            await MainActor.run { focusStealPreventer.start(targetPID: pid) }
+            await hideCursorAfterDelay()
+            return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(button.rawValue) x\(clickCount) (synthetic focus)")
+        }
+
+        // No target PID — global click
+        do {
+            try mouseController.click(at: clickPoint, button: button, clickCount: clickCount)
+            await hideCursorAfterDelay()
+            return .text("Clicked at (\(Int(clickPoint.x)), \(Int(clickPoint.y))) \(button.rawValue) x\(clickCount)")
         } catch {
             return .error("Click failed: \(error)")
         }
+    }
+
+    /// Hide the virtual cursor after a brief delay (lets user see the pulse animation)
+    private func hideCursorAfterDelay() async {
+        try? await Task.sleep(for: .milliseconds(300))
+        await MainActor.run { ComputerUseCursor.shared.hide() }
     }
 
     // MARK: - perform_secondary_action
